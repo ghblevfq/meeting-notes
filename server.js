@@ -673,7 +673,14 @@ const UPSCALE_HTML = `<!DOCTYPE html>
     <button class="scale-btn active" data-scale="2">2×</button>
     <button class="scale-btn" data-scale="3">3×</button>
     <button class="scale-btn" data-scale="4">4×</button>
+    <button class="scale-btn" data-scale="6">6×</button>
+    <button class="scale-btn" data-scale="8">8×</button>
   </div>
+
+  <label style="display:flex;align-items:center;gap:8px;justify-content:center;margin-bottom:16px;font-size:0.9rem;color:#aaa;cursor:pointer;">
+    <input type="checkbox" id="printMode" style="width:16px;height:16px;accent-color:#6c63ff;">
+    Режим печати — TIFF без потерь (для баннеров)
+  </label>
 
   <button class="btn" id="upscaleBtn" disabled>Увеличить</button>
 
@@ -699,6 +706,7 @@ const UPSCALE_HTML = `<!DOCTYPE html>
   const resultWrap = document.getElementById('resultWrap');
   const resultImg = document.getElementById('resultImg');
   const downloadBtn = document.getElementById('downloadBtn');
+  const printModeChk = document.getElementById('printMode');
   let selectedFile = null;
   let selectedScale = 2;
 
@@ -749,6 +757,7 @@ const UPSCALE_HTML = `<!DOCTYPE html>
     const formData = new FormData();
     formData.append('image', selectedFile);
     formData.append('scale', selectedScale);
+    if (printModeChk.checked) formData.append('print', '1');
 
     try {
       const resp = await fetch('/upscale', { method: 'POST', body: formData });
@@ -759,19 +768,20 @@ const UPSCALE_HTML = `<!DOCTYPE html>
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
       const ext = resp.headers.get('X-Output-Format') || 'png';
+      const outW = resp.headers.get('X-Output-Width');
+      const outH = resp.headers.get('X-Output-Height');
       const baseName = selectedFile.name.replace(/\\.[^.]+$/, '');
 
-      resultImg.src = url;
+      if (ext !== 'tiff') {
+        resultImg.src = url;
+        resultWrap.style.display = 'block';
+      }
       downloadBtn.href = url;
       downloadBtn.download = baseName + '_' + selectedScale + 'x.' + ext;
-      resultWrap.style.display = 'block';
 
-      const img = new Image();
-      img.onload = () => {
-        status.textContent = 'Готово! ' + img.width + ' × ' + img.height + ' px';
-        status.className = 'status success';
-      };
-      img.src = url;
+      const sizeInfo = outW && outH ? outW + ' × ' + outH + ' px' : '';
+      status.textContent = 'Готово! ' + sizeInfo + (ext === 'tiff' ? ' (TIFF)' : '');
+      status.className = 'status success';
     } catch (e) {
       status.textContent = e.message;
       status.className = 'status error';
@@ -793,28 +803,56 @@ app.post('/upscale', imageUpload.single('image'), async (req, res) => {
     return res.status(400).json({ error: 'No image uploaded or unsupported format' });
   }
 
-  const scale = Math.min(4, Math.max(1, parseInt(req.body.scale) || 2));
+  const scale = Math.min(8, Math.max(1, parseInt(req.body.scale) || 2));
   const mime = req.file.mimetype;
+  // Always output TIFF for print when scale >= 3 to preserve maximum quality
+  const printMode = req.body.print === '1';
 
   let fmt;
-  if (mime === 'image/png') fmt = 'png';
+  if (printMode && scale >= 3) fmt = 'tiff';
+  else if (mime === 'image/png') fmt = 'png';
   else if (mime === 'image/webp') fmt = 'webp';
   else if (mime === 'image/tiff') fmt = 'tiff';
   else fmt = 'jpeg';
+
+  const outMime = fmt === 'tiff' ? 'image/tiff' : mime;
 
   try {
     const metadata = await sharp(req.file.buffer).metadata();
     const newWidth = Math.round(metadata.width * scale);
     const newHeight = Math.round(metadata.height * scale);
 
-    const outputBuffer = await sharp(req.file.buffer)
+    // For large upscales, do two passes to reduce Lanczos ringing artifacts
+    let pipeline = sharp(req.file.buffer);
+    if (scale >= 3) {
+      const midWidth = Math.round(metadata.width * 2);
+      const midHeight = Math.round(metadata.height * 2);
+      const midBuf = await pipeline
+        .resize(midWidth, midHeight, { kernel: sharp.kernel.lanczos3 })
+        .toFormat('png')
+        .toBuffer();
+      pipeline = sharp(midBuf);
+    }
+
+    const formatOpts = fmt === 'tiff'
+      ? { compression: 'lzw', predictor: 'horizontal' }
+      : fmt === 'jpeg'
+        ? { quality: 97, chromaSubsampling: '4:4:4' }
+        : fmt === 'png'
+          ? { compressionLevel: 6 }
+          : { quality: 97 };
+
+    const outputBuffer = await pipeline
       .resize(newWidth, newHeight, { kernel: sharp.kernel.lanczos3 })
-      .toFormat(fmt, { quality: 95 })
+      .sharpen({ sigma: 0.6, m1: 0.5, m2: 2.5 })
+      .toFormat(fmt, formatOpts)
       .toBuffer();
 
-    res.setHeader('Content-Type', mime);
+    res.setHeader('Content-Type', outMime);
     res.setHeader('Content-Disposition', 'attachment');
     res.setHeader('X-Output-Format', fmt);
+    res.setHeader('X-Output-Width', String(newWidth));
+    res.setHeader('X-Output-Height', String(newHeight));
     res.send(outputBuffer);
   } catch (err) {
     console.error('Upscale error:', err);
