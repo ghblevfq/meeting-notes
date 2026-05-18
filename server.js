@@ -6,6 +6,7 @@ const { execFile } = require('child_process');
 const OpenAI = require('openai');
 const TelegramBot = require('node-telegram-bot-api');
 const FFMPEG = require('ffmpeg-static');
+const sharp = require('sharp');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -544,6 +545,282 @@ function splitText(text, maxLen) {
   }
   return parts;
 }
+
+// ---- Image upscaling ----
+
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/tiff', 'image/gif'];
+    cb(null, allowed.includes(file.mimetype));
+  }
+});
+
+const UPSCALE_HTML = `<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Image Upscaler</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .container { width: 100%; max-width: 520px; text-align: center; }
+  h1 { font-size: 1.6rem; margin-bottom: 8px; color: #fff; }
+  .subtitle { font-size: 0.9rem; color: #888; margin-bottom: 32px; }
+  .upload-area {
+    border: 2px dashed #444;
+    border-radius: 16px;
+    padding: 40px 20px;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+    margin-bottom: 20px;
+  }
+  .upload-area:hover, .upload-area.dragover {
+    border-color: #6c63ff;
+    background: rgba(108,99,255,0.05);
+  }
+  .upload-area .icon { font-size: 3rem; margin-bottom: 12px; }
+  .upload-area p { font-size: 1rem; color: #aaa; }
+  .file-name { font-size: 0.85rem; color: #6c63ff; margin-top: 8px; word-break: break-all; }
+  input[type="file"] { display: none; }
+  .preview-wrap { margin-bottom: 20px; display: none; }
+  .preview-wrap img { max-width: 100%; max-height: 240px; border-radius: 10px; border: 1px solid #333; }
+  .preview-info { font-size: 0.8rem; color: #666; margin-top: 6px; }
+  .scale-row {
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    margin-bottom: 20px;
+  }
+  .scale-btn {
+    flex: 1;
+    max-width: 100px;
+    padding: 10px;
+    border: 2px solid #444;
+    border-radius: 10px;
+    background: transparent;
+    color: #aaa;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  .scale-btn.active { border-color: #6c63ff; color: #fff; background: rgba(108,99,255,0.15); }
+  .btn {
+    display: inline-block;
+    background: #6c63ff;
+    color: #fff;
+    border: none;
+    padding: 14px 40px;
+    font-size: 1.05rem;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background 0.2s, opacity 0.2s;
+    width: 100%;
+    max-width: 300px;
+  }
+  .btn:hover { background: #5a52d5; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .status { margin-top: 24px; font-size: 1rem; min-height: 1.5em; }
+  .status.success { color: #4caf50; }
+  .status.error { color: #ef5350; }
+  .formats { font-size: 0.75rem; color: #555; margin-top: 24px; }
+  .result-wrap { display: none; margin-top: 24px; }
+  .result-wrap img { max-width: 100%; border-radius: 10px; border: 1px solid #333; margin-bottom: 12px; }
+  .download-btn {
+    display: inline-block;
+    background: #4caf50;
+    color: #fff;
+    border: none;
+    padding: 12px 32px;
+    font-size: 1rem;
+    border-radius: 10px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background 0.2s;
+  }
+  .download-btn:hover { background: #388e3c; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Image Upscaler</h1>
+  <p class="subtitle">Увеличьте разрешение изображения в 2x, 3x или 4x</p>
+
+  <div class="upload-area" id="dropArea">
+    <div class="icon">🖼️</div>
+    <p>Нажмите или перетащите изображение</p>
+    <div class="file-name" id="fileName"></div>
+  </div>
+  <input type="file" id="fileInput" accept="image/jpeg,image/png,image/webp,image/tiff,image/gif">
+
+  <div class="preview-wrap" id="previewWrap">
+    <img id="previewImg" src="" alt="preview">
+    <div class="preview-info" id="previewInfo"></div>
+  </div>
+
+  <div class="scale-row">
+    <button class="scale-btn active" data-scale="2">2×</button>
+    <button class="scale-btn" data-scale="3">3×</button>
+    <button class="scale-btn" data-scale="4">4×</button>
+  </div>
+
+  <button class="btn" id="upscaleBtn" disabled>Увеличить</button>
+
+  <div class="status" id="status"></div>
+
+  <div class="result-wrap" id="resultWrap">
+    <img id="resultImg" src="" alt="upscaled">
+    <br>
+    <a class="download-btn" id="downloadBtn" href="#" download>Скачать</a>
+  </div>
+
+  <div class="formats">JPEG, PNG, WebP, TIFF — до 50 МБ</div>
+</div>
+<script>
+  const dropArea = document.getElementById('dropArea');
+  const fileInput = document.getElementById('fileInput');
+  const fileName = document.getElementById('fileName');
+  const upscaleBtn = document.getElementById('upscaleBtn');
+  const status = document.getElementById('status');
+  const previewWrap = document.getElementById('previewWrap');
+  const previewImg = document.getElementById('previewImg');
+  const previewInfo = document.getElementById('previewInfo');
+  const resultWrap = document.getElementById('resultWrap');
+  const resultImg = document.getElementById('resultImg');
+  const downloadBtn = document.getElementById('downloadBtn');
+  let selectedFile = null;
+  let selectedScale = 2;
+
+  document.querySelectorAll('.scale-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.scale-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      selectedScale = parseInt(btn.dataset.scale);
+    });
+  });
+
+  dropArea.addEventListener('click', () => fileInput.click());
+  dropArea.addEventListener('dragover', e => { e.preventDefault(); dropArea.classList.add('dragover'); });
+  dropArea.addEventListener('dragleave', () => dropArea.classList.remove('dragover'));
+  dropArea.addEventListener('drop', e => {
+    e.preventDefault();
+    dropArea.classList.remove('dragover');
+    if (e.dataTransfer.files.length) selectFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', () => { if (fileInput.files.length) selectFile(fileInput.files[0]); });
+
+  function selectFile(file) {
+    selectedFile = file;
+    fileName.textContent = file.name + ' (' + (file.size / 1048576).toFixed(1) + ' MB)';
+    upscaleBtn.disabled = false;
+    status.textContent = '';
+    status.className = 'status';
+    resultWrap.style.display = 'none';
+
+    const reader = new FileReader();
+    reader.onload = e => {
+      previewImg.src = e.target.result;
+      previewWrap.style.display = 'block';
+      const img = new Image();
+      img.onload = () => { previewInfo.textContent = img.width + ' × ' + img.height + ' px'; };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  upscaleBtn.addEventListener('click', async () => {
+    if (!selectedFile) return;
+    upscaleBtn.disabled = true;
+    status.textContent = 'Обработка...';
+    status.className = 'status';
+    resultWrap.style.display = 'none';
+
+    const formData = new FormData();
+    formData.append('image', selectedFile);
+    formData.append('scale', selectedScale);
+
+    try {
+      const resp = await fetch('/upscale', { method: 'POST', body: formData });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.error || 'Ошибка сервера');
+      }
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const ext = resp.headers.get('X-Output-Format') || 'png';
+      const baseName = selectedFile.name.replace(/\\.[^.]+$/, '');
+
+      resultImg.src = url;
+      downloadBtn.href = url;
+      downloadBtn.download = baseName + '_' + selectedScale + 'x.' + ext;
+      resultWrap.style.display = 'block';
+
+      const img = new Image();
+      img.onload = () => {
+        status.textContent = 'Готово! ' + img.width + ' × ' + img.height + ' px';
+        status.className = 'status success';
+      };
+      img.src = url;
+    } catch (e) {
+      status.textContent = e.message;
+      status.className = 'status error';
+    } finally {
+      upscaleBtn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>`;
+
+app.get('/upscale', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(UPSCALE_HTML);
+});
+
+app.post('/upscale', imageUpload.single('image'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No image uploaded or unsupported format' });
+  }
+
+  const scale = Math.min(4, Math.max(1, parseInt(req.body.scale) || 2));
+  const mime = req.file.mimetype;
+
+  let fmt;
+  if (mime === 'image/png') fmt = 'png';
+  else if (mime === 'image/webp') fmt = 'webp';
+  else if (mime === 'image/tiff') fmt = 'tiff';
+  else fmt = 'jpeg';
+
+  try {
+    const metadata = await sharp(req.file.buffer).metadata();
+    const newWidth = Math.round(metadata.width * scale);
+    const newHeight = Math.round(metadata.height * scale);
+
+    const outputBuffer = await sharp(req.file.buffer)
+      .resize(newWidth, newHeight, { kernel: sharp.kernel.lanczos3 })
+      .toFormat(fmt, { quality: 95 })
+      .toBuffer();
+
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Content-Disposition', 'attachment');
+    res.setHeader('X-Output-Format', fmt);
+    res.send(outputBuffer);
+  } catch (err) {
+    console.error('Upscale error:', err);
+    res.status(500).json({ error: 'Image processing failed: ' + err.message });
+  }
+});
 
 // ---- Start server ----
 const server = app.listen(PORT, () => {
